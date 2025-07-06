@@ -1,0 +1,4 @@
+train : custom_dataset/train
+val : custom_dataset/val
+nc : 3
+names : ['khanh ly','manh dung','tra my']
