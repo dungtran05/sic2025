@@ -8,14 +8,13 @@ import os
 import cv2
 import numpy as np
 import pyodbc
-from collections import Counter
 
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
 app = Flask(__name__)
 CORS(app)
 
-# Kết nối SQL Server
+# --- Database Connection ---
 conn = pyodbc.connect(
     "DRIVER={ODBC Driver 17 for SQL Server};"
     "SERVER=tcp:asdjnu12uh12husa.database.windows.net;"
@@ -25,55 +24,57 @@ conn = pyodbc.connect(
 )
 cursor = conn.cursor()
 
-# Load YOLO model
+# --- Load YOLO model ---
 model = YOLO("best.pt")
 
-@app.route("/")
-def index():
-    return "Face Recognition API is running"
 
+# --- Helper Functions ---
 def save_face_to_db(img, name):
-    img_byte_arr = BytesIO()
-    img.save(img_byte_arr, format="JPEG")
-    img_bytes = img_byte_arr.getvalue()
-    cursor.execute("INSERT INTO Faces (Name, Image) VALUES (?, ?)", name, img_bytes)
-    conn.commit()
+    with BytesIO() as buffer:
+        img.save(buffer, format="JPEG")
+        img_bytes = buffer.getvalue()
+        cursor.execute("INSERT INTO Faces (Name, Image) VALUES (?, ?)", name, img_bytes)
+        conn.commit()
 
 def get_all_faces_from_db():
     cursor.execute("SELECT Name, Image FROM Faces")
-    results = cursor.fetchall()
-    face_data = []
-    for name, img_bytes in results:
-        try:
-            img = Image.open(BytesIO(img_bytes)).convert("RGB")
-            face_data.append((name, np.array(img)))
-        except:
-            continue
-    return face_data
+    return [
+        (name, np.array(Image.open(BytesIO(img_bytes)).convert("RGB")))
+        for name, img_bytes in cursor.fetchall()
+        if img_bytes
+    ]
 
 def detect_face(image):
     results = model.predict(image, conf=0.3, save=False)
     boxes = results[0].boxes
-    if not boxes or len(boxes) == 0:
-        return None
-    xyxy = boxes[0].xyxy[0].tolist()
-    x1, y1, x2, y2 = map(int, xyxy)
-    return image.crop((x1, y1, x2, y2))
+    if boxes and len(boxes) > 0:
+        x1, y1, x2, y2 = map(int, boxes[0].xyxy[0].tolist())
+        return image.crop((x1, y1, x2, y2))
+    return None
+
+
+# --- Routes ---
+@app.route("/")
+def index():
+    return "Face Recognition API is running"
 
 @app.route("/register", methods=["POST"])
 def register():
     name = request.form.get("name")
     file = request.files.get("image")
+
     if not name or not file:
         return jsonify({"error": "Missing name or image"}), 400
 
     try:
         image = Image.open(file.stream).convert("RGB")
         face = detect_face(image)
-        if face:
-            save_face_to_db(face, name)
-            return jsonify({"message": "Face registered"}), 200
-        return jsonify({"error": "No face detected"}), 400
+        if not face:
+            return jsonify({"error": "No face detected"}), 400
+
+        save_face_to_db(face, name)
+        return jsonify({"message": "Face registered successfully"}), 200
+
     except Exception as e:
         return jsonify({"error": f"Image processing error: {str(e)}"}), 500
 
@@ -85,35 +86,35 @@ def verify_frame():
 
     try:
         image = Image.open(file.stream).convert("RGB")
-    except:
-        return jsonify({"error": "Invalid image"}), 400
+        face = detect_face(image)
+        if not face:
+            return jsonify({"predictions": []}), 200
 
-    face = detect_face(image)
-    detected_names = []
-
-    if face:
         face_np = np.array(face)
         for db_name, db_img_np in get_all_faces_from_db():
             try:
                 result = DeepFace.verify(face_np, db_img_np, enforce_detection=False)
-                if result["verified"]:
-                    detected_names.append(db_name)
-                    break
+                if result.get("verified"):
+                    return jsonify({
+                        "predictions": [{
+                            "class_name": db_name,
+                            "confidence": 1.0
+                        }]
+                    }), 200
             except:
                 continue
 
-    predictions = [{
-        "class_name": name,
-        "confidence": 1.0
-    } for name in detected_names]
+        return jsonify({"predictions": []}), 200
 
-    return jsonify({"predictions": predictions}), 200
+    except Exception as e:
+        return jsonify({"error": f"Verification error: {str(e)}"}), 500
 
 @app.route("/faces", methods=["GET"])
 def list_faces():
     cursor.execute("SELECT Name, COUNT(*) FROM Faces GROUP BY Name")
-    rows = cursor.fetchall()
-    return jsonify({"faces": [{"name": name, "count": count} for name, count in rows]})
+    return jsonify({
+        "faces": [{"name": name, "count": count} for name, count in cursor.fetchall()]
+    })
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
