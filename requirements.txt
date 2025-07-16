@@ -67,7 +67,7 @@ lxml_html_clean==0.4.2
 lz4==4.4.4
 matplotlib==3.9.2
 memory-profiler==0.61.0
-mkl-service==2.4.0
+
 ml_dtypes==0.5.1
 
 namex==0.1.0
