@@ -1,13 +1,15 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-from ultralytics import YOLO
-from deepface import DeepFace
+from facenet_pytorch import InceptionResnetV1
+from torchvision import transforms
 from PIL import Image
 from io import BytesIO
 import os
-import cv2
 import numpy as np
 import pyodbc
+import torch
+import cv2
+from sklearn.metrics.pairwise import cosine_similarity
 
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
@@ -24,39 +26,54 @@ conn = pyodbc.connect(
 )
 cursor = conn.cursor()
 
-# --- Load YOLO model ---
-model = YOLO("best.pt")
+# --- Load FaceNet Model ---
+facenet = InceptionResnetV1(pretrained='vggface2').eval()
 
+# --- Haar Cascade Classifier ---
+face_cascade = cv2.CascadeClassifier("haarcascade_frontalface_default.xml")
+
+# --- Preprocess Transform ---
+transform = transforms.Compose([
+    transforms.Resize((160, 160)),
+    transforms.ToTensor(),
+    transforms.Normalize([0.5], [0.5])
+])
 
 # --- Helper Functions ---
-def save_face_to_db(img, name):
-    with BytesIO() as buffer:
-        img.save(buffer, format="JPEG")
-        img_bytes = buffer.getvalue()
-        cursor.execute("INSERT INTO Faces (Name, Image) VALUES (?, ?)", name, img_bytes)
-        conn.commit()
+def detect_face(pil_image):
+    cv_image = cv2.cvtColor(np.array(pil_image), cv2.COLOR_RGB2BGR)
+    gray = cv2.cvtColor(cv_image, cv2.COLOR_BGR2GRAY)
+    faces = face_cascade.detectMultiScale(gray, 1.3, 5)
 
-def get_all_faces_from_db():
-    cursor.execute("SELECT Name, Image FROM Faces")
-    return [
-        (name, np.array(Image.open(BytesIO(img_bytes)).convert("RGB")))
-        for name, img_bytes in cursor.fetchall()
-        if img_bytes
-    ]
-
-def detect_face(image):
-    results = model.predict(image, conf=0.3, save=False)
-    boxes = results[0].boxes
-    if boxes and len(boxes) > 0:
-        x1, y1, x2, y2 = map(int, boxes[0].xyxy[0].tolist())
-        return image.crop((x1, y1, x2, y2))
+    if len(faces) > 0:
+        x, y, w, h = faces[0]  # lấy khuôn mặt đầu tiên
+        cropped_face = pil_image.crop((x, y, x + w, y + h))
+        return cropped_face
     return None
 
+def get_face_embedding(face_img):
+    face_tensor = transform(face_img).unsqueeze(0)
+    with torch.no_grad():
+        embedding = facenet(face_tensor)
+    return embedding.numpy()[0]
+
+def save_face_to_db(img, name):
+    embedding = get_face_embedding(img)
+    embedding_bytes = embedding.tobytes()
+    cursor.execute("INSERT INTO Faces (Name, Embedding) VALUES (?, ?)", name, embedding_bytes)
+    conn.commit()
+
+def get_all_embeddings_from_db():
+    cursor.execute("SELECT Name, Embedding FROM Faces")
+    return [
+        (name, np.frombuffer(embedding, dtype=np.float32))
+        for name, embedding in cursor.fetchall()
+    ]
 
 # --- Routes ---
 @app.route("/")
 def index():
-    return "Face Recognition API is running"
+    return "Face Recognition API (OpenCV + FaceNet) is running"
 
 @app.route("/register", methods=["POST"])
 def register():
@@ -90,19 +107,17 @@ def verify_frame():
         if not face:
             return jsonify({"predictions": []}), 200
 
-        face_np = np.array(face)
-        for db_name, db_img_np in get_all_faces_from_db():
-            try:
-                result = DeepFace.verify(face_np, db_img_np, enforce_detection=False)
-                if result.get("verified"):
-                    return jsonify({
-                        "predictions": [{
-                            "class_name": db_name,
-                            "confidence": 1.0
-                        }]
-                    }), 200
-            except:
-                continue
+        input_embedding = get_face_embedding(face).reshape(1, -1)
+
+        for db_name, db_embedding in get_all_embeddings_from_db():
+            similarity = cosine_similarity(input_embedding, db_embedding.reshape(1, -1))[0][0]
+            if similarity > 0.6:
+                return jsonify({
+                    "predictions": [{
+                        "class_name": db_name,
+                        "confidence": float(similarity)
+                    }]
+                }), 200
 
         return jsonify({"predictions": []}), 200
 
